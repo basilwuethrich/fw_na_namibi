@@ -1,0 +1,155 @@
+###############################################################################
+# 03_network_mantel_workflow.R — Mantel networks from PA matrices built per group
+#
+# What it does (high-level):
+# 1) Load SWARM/DADA2 clean_long + standardize to common schema (dat0)
+# 2) Optional replicate merge (only remaps sample IDs; no row loss)
+# 3) Build group_id (class or family / class:family), without dropping rows
+# 4) Build PA matrices per group_id (otu OR species+genus unique)
+# 5) Convert PA -> Jaccard distances per group_id
+# 6) Pairwise Mantel between groups => edges + igraph plot
+#
+# Inputs:
+#   data/processed/sample_meta.rds
+#   data/processed/swarm_clean_long.rds
+#   data/processed/dada2_clean_long.rds
+#
+# Outputs:
+#   results/MANTEL_PA_NETWORK/<pipeline>/<taxlevel>/<fill>/<label>/*
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(vegan)
+  library(igraph)
+  library(here)
+})
+
+HAS_RAGG <- requireNamespace("ragg", quietly = TRUE)
+
+###############################################################################
+# 00) CONFIG (edit only here)
+###############################################################################
+
+# ---- Paths (GitHub-ready) ----
+DATA_DIR <- here::here("data", "processed")
+OUT_BASE <- here::here("results", "MANTEL_PA_NETWORK")
+
+path_sample_meta <- file.path(DATA_DIR, "sample_meta.rds")
+path_swarm_long  <- file.path(DATA_DIR, "swarm_clean_long.rds")
+path_dada2_long  <- file.path(DATA_DIR, "dada2_clean_long.rds")
+
+stopifnot(file.exists(path_sample_meta),
+          file.exists(path_swarm_long),
+          file.exists(path_dada2_long))
+
+# ---- Choose pipeline ----
+pipeline <- "swarm"   # "swarm" or "dada2"
+
+# ---- Replicate merge ----
+MERGE_REPS <- TRUE
+
+replicate_pairs <- list(
+  c("SPY221856", "SPY221857"),
+  c("SPY221858", "SPY221859"),
+  c("SPY221860", "SPY221861"),
+  c("SPY221862", "SPY221863"),
+  c("SPY221864", "SPY221865"),
+  c("SPY221866", "SPY221867"),
+  c("SPY221868", "SPY221869"),
+  c("SPY221872", "SPY221873"),
+  c("SPY221870", "SPY221871"),
+  c("SPY221653", "SPY221654")
+)
+
+# ---- Grouping ----
+tax_level <- "class"          # "class" or "family"
+family_id_mode <- "class:family"  # "class:family" or "family"
+
+DROP_UNCLASSIFIED_CLASS  <- TRUE
+DROP_UNCLASSIFIED_FAMILY <- FALSE
+
+# ---- Taxon fill mode for PA ----
+fill_mode <- "otu"            # "otu" or "species+genus"
+marker_choice <- "ALL"        # "ALL" or e.g. c("teleoF","V05")
+
+# ---- Distances + Mantel ----
+dist_method <- "jaccard"      # for PA
+DROP_ZERO_SAMPLES <- TRUE
+MIN_SAMPLES_PER_GROUP <- 3
+MIN_COMMON_SAMPLES_MANTEL <- 3
+
+mantel_method <- "pearson"
+mantel_permutations <- 999
+
+alpha <- 0.05
+r_min <- 0.0
+
+# ---- Runs ----
+RUN_PER_MARKER <- TRUE        # networks per marker
+RUN_ALLMARKERS <- TRUE        # one combined network
+RUN_NETWORKS_PER_CLASS <- FALSE   # for family-level class:family, run marker x class subsets
+SKIP_CLASS_UNCLASSIFIED <- FALSE
+
+# ---- Plotting ----
+NODE_COLOR_BY <- "class"      # "class" or "family"
+
+set.seed(1)  # reproducible Mantel permutation tests
+
+###############################################################################
+# 01) Load data
+###############################################################################
+
+sample_meta      <- readRDS(path_sample_meta)
+swarm_clean_long <- readRDS(path_swarm_long)
+dada2_clean_long <- readRDS(path_dada2_long)
+
+###############################################################################
+# 02) Helpers
+###############################################################################
+
+clean_chr <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", "NA", "N/A", "na", "n/a")] <- NA
+  x
+}
+
+make_replicate_lookup <- function(replicate_pairs) {
+  lookup <- character()
+  for (pair in replicate_pairs) {
+    lookup[pair[1]] <- pair[1]
+    lookup[pair[2]] <- pair[1]
+  }
+  lookup
+}
+
+apply_replicate_merge <- function(dat0, replicate_pairs, merge = TRUE) {
+  if (!merge) return(dat0)
+  rep_lookup <- make_replicate_lookup(replicate_pairs)
+  dat0 %>%
+    mutate(sample_name_raw = sample_name,
+           sample_name = ifelse(sample_name %in% names(rep_lookup), rep_lookup[sample_name], sample_name))
+}
+
+load_and_standardize <- function(pipeline, swarm_clean_long, dada2_clean_long) {
+  pipeline <- match.arg(tolower(pipeline), c("dada2","swarm"))
+  df <- if (pipeline == "dada2") dada2_clean_long else swarm_clean_long
+
+  dat0 <- df %>%
+    transmute(
+      sample_name = as.character(sample_id),
+      marker      = as.character(marker),
+      class_name  = clean_chr(class),
+      family      = clean_chr(family),
+      genus       = clean_chr(genus),
+      species     = clean_chr(species),
+      definition  = as.character(feature_id)
+    )
+
+  stopifnot(all(c("sample_name","marker","class_name","family","genus","species","definition") %in% names(dat0)))
+  dat0
+}
+
+make
+
