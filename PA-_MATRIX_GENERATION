@@ -1,0 +1,199 @@
+###############################################################################
+# 02_make_matrices.R  —  build 24 PA matrices (SWARM + DADA2), merged & unmerged
+#
+# Output:
+#   - results/PA_matrices/*.rds   (24 matrices)
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+})
+
+###############################################################################
+# 00) CONFIG  (GitHub-ready: project-relative paths via here())
+###############################################################################
+
+DATA_DIR <- here::here("data", "processed")      # contains *.rds from 01_clean_data.R
+OUT_DIR  <- here::here("results", "PA_matrices") # matrices written here
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+path_sample_meta <- file.path(DATA_DIR, "sample_meta.rds")
+path_swarm_long  <- file.path(DATA_DIR, "swarm_clean_long.rds")
+path_dada2_long  <- file.path(DATA_DIR, "dada2_clean_long.rds")
+
+# Optional sanity checks
+stopifnot(file.exists(path_sample_meta),
+          file.exists(path_swarm_long),
+          file.exists(path_dada2_long))
+
+###############################################################################
+# 01) LOAD
+###############################################################################
+
+sample_meta      <- readRDS(path_sample_meta)
+swarm_clean_long <- readRDS(path_swarm_long)
+dada2_clean_long <- readRDS(path_dada2_long)
+
+stopifnot(nrow(sample_meta) > 0, nrow(swarm_clean_long) > 0, nrow(dada2_clean_long) > 0)
+
+###############################################################################
+# 02) Replicate pairs
+###############################################################################
+
+replicate_pairs <- list(
+  c("SPY221856", "SPY221857"),
+  c("SPY221858", "SPY221859"),
+  c("SPY221860", "SPY221861"),
+  c("SPY221862", "SPY221863"),
+  c("SPY221864", "SPY221865"),
+  c("SPY221866", "SPY221867"),
+  c("SPY221868", "SPY221869"),
+  c("SPY221872", "SPY221873"),
+  c("SPY221870", "SPY221871"),
+  c("SPY221653", "SPY221654")
+)
+
+make_replicate_lookup <- function(replicate_pairs) {
+  lookup <- character()
+  for (pair in replicate_pairs) {
+    lookup[pair[1]] <- pair[1]
+    lookup[pair[2]] <- pair[1]
+  }
+  lookup
+}
+
+merge_replicates_long <- function(df, replicate_pairs) {
+  lookup <- make_replicate_lookup(replicate_pairs)
+
+  df %>%
+    mutate(sample_id = if_else(sample_id %in% names(lookup), lookup[sample_id], sample_id)) %>%
+    group_by(sample_id, feature_id) %>%
+    summarise(count = sum(count, na.rm = TRUE), .groups = "drop")
+}
+
+make_pa_matrix <- function(df_long) {
+  df_long %>%
+    distinct(sample_id, feature_id) %>%
+    mutate(presence = 1L) %>%
+    pivot_wider(
+      names_from = feature_id,
+      values_from = presence,
+      values_fill = 0L
+    ) %>%
+    tibble::column_to_rownames("sample_id") %>%
+    as.matrix()
+}
+
+###############################################################################
+# 03) Filters
+###############################################################################
+
+# Class synonyms (robust against Actinopteri vs Actinopterygii)
+class_synonyms <- list(
+  Actinopteri = c("Actinopteri", "Actinopterygii"),
+  Aves        = c("Aves"),
+  Mammalia    = c("Mammalia"),
+  Bivalvia    = c("Bivalvia")
+)
+
+apply_filters <- function(df, marker_keep = NULL, marker_drop_regex = NULL, class_keep = NULL) {
+  out <- df
+
+  if (!is.null(marker_keep)) {
+    stopifnot("marker" %in% names(out))
+    out <- out %>% filter(marker %in% marker_keep)
+  }
+  if (!is.null(marker_drop_regex)) {
+    stopifnot("marker" %in% names(out))
+    out <- out %>% filter(!stringr::str_detect(marker, marker_drop_regex))
+  }
+  if (!is.null(class_keep)) {
+    if (!("class" %in% names(out))) {
+      stop("Filter wants 'class', but df has no 'class' column.")
+    }
+    out <- out %>% filter(class %in% class_keep)
+  }
+
+  out
+}
+
+build_and_save_pa <- function(dataset, filter_name, df_long, out_dir, merged = FALSE) {
+
+  df_use <- if (merged) merge_replicates_long(df_long, replicate_pairs) else df_long
+  suffix <- if (merged) "merged" else "unmerged"
+
+  pa <- make_pa_matrix(df_use)
+
+  file_out <- file.path(out_dir, paste0("PA_", dataset, "__", filter_name, "__", suffix, ".rds"))
+  saveRDS(pa, file_out)
+
+  message(sprintf("[%s | %s | %s] %d samples x %d features -> %s",
+                  dataset, filter_name, suffix, nrow(pa), ncol(pa), basename(file_out)))
+
+  invisible(pa)
+}
+
+###############################################################################
+# 04) Define 24 filtersets
+###############################################################################
+
+# SWARM filters
+swarm_filters <- list(
+  SWARM_all_primers = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = NULL),
+  SWARM_no_Euka3    = list(marker_keep = NULL, marker_drop_regex = "Euka3", class_keep = NULL),
+
+  SWARM_class_Bivalvia    = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Bivalvia),
+  SWARM_class_Mammalia    = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Mammalia),
+  SWARM_class_Actinopteri = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Actinopteri),
+  SWARM_class_Aves        = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Aves)
+)
+
+# DADA2 filters
+dada2_3primers <- c("12SVSF", "teleoF", "VeneridaF")
+
+dada2_filters <- list(
+  DADA2_all_primers = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = NULL),
+  DADA2_3primers    = list(marker_keep = dada2_3primers, marker_drop_regex = NULL, class_keep = NULL),
+
+  DADA2_class_Actinopteri = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Actinopteri),
+  DADA2_class_Aves        = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Aves),
+  DADA2_class_Mammalia    = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Mammalia),
+  DADA2_class_Bivalvia    = list(marker_keep = NULL, marker_drop_regex = NULL, class_keep = class_synonyms$Bivalvia)
+)
+
+###############################################################################
+# 05) Build matrices (unmerged + merged)
+###############################################################################
+
+# SWARM
+for (nm in names(swarm_filters)) {
+  f <- swarm_filters[[nm]]
+
+  swarm_long_filt <- apply_filters(
+    swarm_clean_long,
+    marker_keep = f$marker_keep,
+    marker_drop_regex = f$marker_drop_regex,
+    class_keep = f$class_keep
+  )
+
+  build_and_save_pa("SWARM", nm, swarm_long_filt, out_dir = OUT_DIR, merged = FALSE)
+  build_and_save_pa("SWARM", nm, swarm_long_filt, out_dir = OUT_DIR, merged = TRUE)
+}
+
+# DADA2
+for (nm in names(dada2_filters)) {
+  f <- dada2_filters[[nm]]
+
+  dada2_long_filt <- apply_filters(
+    dada2_clean_long,
+    marker_keep = f$marker_keep,
+    marker_drop_regex = f$marker_drop_regex,
+    class_keep = f$class_keep
+  )
+
+  build_and_save_pa("DADA2", nm, dada2_long_filt, out_dir = OUT_DIR, merged = FALSE)
+  build_and_save_pa("DADA2", nm, dada2_long_filt, out_dir = OUT_DIR, merged = TRUE)
+}
+
+message("✅ Done. All PA matrices saved to: ", OUT_DIR)
