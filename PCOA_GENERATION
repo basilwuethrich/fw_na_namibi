@@ -1,0 +1,235 @@
+###############################################################################
+# 03_pcoa_maps.R  —  PCoA + Gradient-Style Plot + Map (for all PA matrices)
+#
+# Inputs:
+#   - results/PA_matrices/*.rds        (from 02_make_matrices.R)
+#   - data/processed/sample_meta.rds   (coords)
+#
+# Outputs:
+#   - results/pcoa_maps/PCoA_scores/*.csv
+#   - results/pcoa_maps/plots_pcoa/*.(png|pdf)
+#   - results/pcoa_maps/plots_maps/*.(png|pdf)
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(betapart)
+  library(ade4)
+  library(ggplot2)
+  library(maps)
+  library(ggrepel)
+  library(stringr)
+  library(here)
+})
+
+HAS_RAGG  <- requireNamespace("ragg", quietly = TRUE)
+HAS_CAIRO <- capabilities("cairo")
+
+###############################################################################
+# 00) CONFIG (GitHub-ready)
+###############################################################################
+
+DATA_DIR <- here::here("data", "processed")
+PA_DIR   <- here::here("results", "PA_matrices")
+
+RESULT_DIR <- here::here("results", "pcoa_maps")
+DIR_SCORES <- file.path(RESULT_DIR, "PCoA_scores")
+DIR_PCOA   <- file.path(RESULT_DIR, "plots_pcoa")
+DIR_MAPS   <- file.path(RESULT_DIR, "plots_maps")
+
+dir.create(RESULT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_SCORES, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_PCOA,   recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_MAPS,   recursive = TRUE, showWarnings = FALSE)
+
+path_sample_meta <- file.path(DATA_DIR, "sample_meta.rds")
+stopifnot(file.exists(path_sample_meta))
+stopifnot(dir.exists(PA_DIR))
+
+index_family <- "jaccard"  # or "sorensen"
+
+###############################################################################
+# 01) Load sample_meta
+###############################################################################
+
+sample_meta <- readRDS(path_sample_meta)
+
+# expected: sample_id, decimalLatitude, decimalLongitude
+if (!"sample_id" %in% names(sample_meta) && "sample_name" %in% names(sample_meta)) {
+  sample_meta <- sample_meta %>% rename(sample_id = sample_name)
+}
+stopifnot(all(c("sample_id","decimalLatitude","decimalLongitude") %in% names(sample_meta)))
+
+###############################################################################
+# 02) Replicate mapping helpers (must match 02_make_matrices.R)
+###############################################################################
+
+replicate_pairs <- list(
+  c("SPY221856", "SPY221857"),
+  c("SPY221858", "SPY221859"),
+  c("SPY221860", "SPY221861"),
+  c("SPY221862", "SPY221863"),
+  c("SPY221864", "SPY221865"),
+  c("SPY221866", "SPY221867"),
+  c("SPY221868", "SPY221869"),
+  c("SPY221872", "SPY221873"),
+  c("SPY221870", "SPY221871"),
+  c("SPY221653", "SPY221654")
+)
+
+make_replicate_lookup <- function(replicate_pairs) {
+  lookup <- character()
+  for (pair in replicate_pairs) {
+    lookup[pair[1]] <- pair[1]
+    lookup[pair[2]] <- pair[1]
+  }
+  lookup
+}
+
+get_coords_for_matrix <- function(pa_mat, sample_meta, merged_flag = FALSE, replicate_pairs = NULL) {
+  coords <- sample_meta %>%
+    select(sample_id, decimalLatitude, decimalLongitude) %>%
+    distinct()
+
+  if (merged_flag) {
+    lookup <- make_replicate_lookup(replicate_pairs)
+    coords <- coords %>%
+      mutate(sample_id = if_else(sample_id %in% names(lookup), lookup[sample_id], sample_id)) %>%
+      group_by(sample_id) %>%
+      summarise(
+        decimalLatitude  = mean(decimalLatitude,  na.rm = TRUE),
+        decimalLongitude = mean(decimalLongitude, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  coords <- coords %>% filter(sample_id %in% rownames(pa_mat))
+  coords <- coords[match(rownames(pa_mat), coords$sample_id), ]
+  coords
+}
+
+###############################################################################
+# 03) PCoA + gradient style helpers
+###############################################################################
+
+compute_angle_distance <- function(scores_df) {
+  center <- colMeans(scores_df[, c("PCoA1", "PCoA2")], na.rm = TRUE)
+
+  dx <- scores_df$PCoA1 - center[1]
+  dy <- scores_df$PCoA2 - center[2]
+
+  angles <- atan2(dy, dx)                 # -pi..pi
+  dist   <- sqrt(dx^2 + dy^2)
+
+  angle_norm <- (angles + pi) / (2 * pi)  # 0..1
+  dist_norm  <- ifelse(max(dist) == min(dist), 0, (dist - min(dist)) / (max(dist) - min(dist)))
+
+  scores_df %>%
+    mutate(
+      Angle      = angle_norm,
+      SizeValue  = dist_norm,
+      ColorValue = angle_norm
+    )
+}
+
+make_label_map <- function(sample_ids) {
+  tibble(sample_id = sort(unique(sample_ids))) %>%
+    mutate(label = row_number())
+}
+
+plot_pcoa_gradient <- function(plot_data, var_exp, title) {
+  ggplot(plot_data, aes(x = PCoA1, y = PCoA2, color = Angle, size = SizeValue)) +
+    geom_point(alpha = 0.85) +
+    geom_text(aes(label = label), vjust = 2, size = 4, color = "black", fontface = "bold") +
+    scale_color_gradientn(
+      colors = c("red", "orange", "yellow", "green", "blue", "purple", "red"),
+      name = "Direction from center",
+      breaks = seq(0, 1, 0.25),
+      labels = c("E", "N", "W", "S", "E")
+    ) +
+    scale_size_continuous(
+      name = "Distance from center",
+      range = c(3, 8),
+      breaks = seq(0, 1, 0.25)
+    ) +
+    labs(
+      x = paste0("PCoA1 (", round(var_exp[1], 1), "%)"),
+      y = paste0("PCoA2 (", round(var_exp[2], 1), "%)"),
+      title = title,
+      subtitle = "Color = direction in PCoA space; Size = distance from center"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+plot_map_gradient <- function(map_df, title) {
+  world_map_df <- ggplot2::map_data("world")
+
+  lon_range <- range(map_df$decimalLongitude, na.rm = TRUE)
+  lat_range <- range(map_df$decimalLatitude,  na.rm = TRUE)
+
+  lon_margin <- diff(lon_range) * 0.2
+  lat_margin <- diff(lat_range) * 0.2
+
+  lon_limits <- lon_range + c(-lon_margin, lon_margin)
+  lat_limits <- lat_range + c(-lat_margin, lat_margin)
+
+  ggplot() +
+    geom_polygon(
+      data = world_map_df,
+      aes(x = long, y = lat, group = group),
+      fill = "gray90", color = "gray50", linewidth = 0.2
+    ) +
+    geom_point(
+      data = map_df,
+      aes(x = decimalLongitude, y = decimalLatitude, color = ColorValue, size = SizeValue),
+      alpha = 0.85
+    ) +
+    geom_text_repel(
+      data = map_df,
+      aes(x = decimalLongitude, y = decimalLatitude, label = label),
+      size = 4,
+      color = "black",
+      fontface = "bold",
+      box.padding = 0.5,
+      point.padding = 0.3,
+      min.segment.length = 0.2,
+      force = 1,
+      max.overlaps = Inf
+    ) +
+    scale_color_gradientn(
+      colors = c("red", "orange", "yellow", "green", "blue", "purple", "red"),
+      name = "Direction from center",
+      breaks = seq(0, 1, 0.25),
+      labels = c("E", "N", "W", "S", "E")
+    ) +
+    scale_size_continuous(
+      name = "Distance from center",
+      range = c(4, 8),
+      breaks = seq(0, 1, 0.25)
+    ) +
+    coord_fixed(xlim = lon_limits, ylim = lat_limits, ratio = 1.3) +
+    labs(
+      title = title,
+      subtitle = "Color/Size from PCoA space",
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 12)
+    )
+}
+
+save_plot <- function(p, filename, width, height, dpi = 300) {
+  if (HAS_RAGG) {
+    ggplot2::ggsave(filename, p, width = width, height = height, dpi = dpi,
+                    bg = "white", device = ragg::agg_png)
+  } else {
+    ggplot2::ggsave(filename, p, width = width, height = height, dpi = dpi, bg = "white")
+  }
+}
+
+save_pdf <- function(p, filename, width, height_
