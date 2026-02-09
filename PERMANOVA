@@ -1,0 +1,450 @@
+###############################################################################
+# 05_urban_influence_pcoa_ALL_both_plus_NDVI.R
+#
+# Iterate over ALL PA matrices and test (PERMANOVA):
+#   - urban_influence_max
+#   - urban_influence_sum
+#   - NDVI (from climate_full)
+#
+# Output per matrix:
+#   - PERMANOVA CSV (max + sum + ndvi)
+#   - plot_data.csv + sample_coords_with_city.csv
+#   - PCoA + scatters ONLY if significant (raw p < alpha)
+#
+# Plus:
+#   - SUMMARY_permanova.csv (raw p + BH-FDR p)
+#
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(geosphere)
+  library(betapart)
+  library(ade4)
+  library(vegan)
+  library(ggplot2)
+  library(viridis)   # used for PCoA point colors
+  library(stringr)
+})
+
+###############################################################################
+# 00) CONFIG
+###############################################################################
+
+PDF_DEVICE <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+
+DATA_DIR   <- here::here("data", "processed")
+PA_DIR     <- file.path(DATA_DIR, "PA_matrices")
+RESULT_DIR <- here::here("results", "urban_influence_pcoa")
+
+dir.create(RESULT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULT_DIR, "PERMANOVA"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULT_DIR, "PLOTS_PCOA"),    showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULT_DIR, "PLOTS_SCATTER"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(RESULT_DIR, "TABLES"),        showWarnings = FALSE, recursive = TRUE)
+
+alpha <- 0.05
+
+# Inputs
+path_sample_meta  <- file.path(DATA_DIR, "sample_meta.rds")
+path_climate_full <- file.path(DATA_DIR, "climate_full.rds")
+
+stopifnot(dir.exists(PA_DIR), file.exists(path_sample_meta), file.exists(path_climate_full))
+
+# Log file
+log_file <- file.path(RESULT_DIR, "run_log.txt")
+zz <- file(log_file, open = "wt")
+sink(zz, split = TRUE)
+on.exit({ sink(); close(zz) }, add = TRUE)
+
+###############################################################################
+# 01) SAMPLE META + REPLICATE HELPERS
+###############################################################################
+
+sample_meta <- readRDS(path_sample_meta)
+if (!"sample_id" %in% names(sample_meta) && "sample_name" %in% names(sample_meta)) {
+  sample_meta <- sample_meta %>% rename(sample_id = sample_name)
+}
+
+replicate_pairs <- list(
+  c("SPY221856", "SPY221857"),
+  c("SPY221858", "SPY221859"),
+  c("SPY221860", "SPY221861"),
+  c("SPY221862", "SPY221863"),
+  c("SPY221864", "SPY221865"),
+  c("SPY221866", "SPY221867"),
+  c("SPY221868", "SPY221869"),
+  c("SPY221872", "SPY221873"),
+  c("SPY221870", "SPY221871"),
+  c("SPY221653", "SPY221654")
+)
+
+make_replicate_lookup <- function(replicate_pairs) {
+  lookup <- character()
+  for (pair in replicate_pairs) {
+    lookup[pair[1]] <- pair[1]
+    lookup[pair[2]] <- pair[1]
+  }
+  lookup
+}
+
+get_coords_for_matrix <- function(pa_mat, sample_meta, merged_flag = FALSE, replicate_pairs = NULL) {
+  coords <- sample_meta %>%
+    select(sample_id, decimalLatitude, decimalLongitude) %>%
+    distinct()
+
+  if (merged_flag) {
+    lookup <- make_replicate_lookup(replicate_pairs)
+    coords <- coords %>%
+      mutate(sample_id = if_else(sample_id %in% names(lookup), lookup[sample_id], sample_id)) %>%
+      group_by(sample_id) %>%
+      summarise(
+        decimalLatitude  = mean(decimalLatitude,  na.rm = TRUE),
+        decimalLongitude = mean(decimalLongitude, na.rm = TRUE),
+        .groups = "drop"
+      )
+  }
+
+  coords <- coords %>% filter(sample_id %in% rownames(pa_mat))
+  coords <- coords[match(rownames(pa_mat), coords$sample_id), ]
+  coords
+}
+
+###############################################################################
+# 02) CLIMATE (NDVI) LOOKUP
+###############################################################################
+
+climate_full <- readRDS(path_climate_full) %>%
+  rename(sample_id = id)
+
+if (!"sample_id" %in% names(climate_full) && "sample_name" %in% names(climate_full)) {
+  climate_full <- climate_full %>% rename(sample_id = sample_name)
+}
+
+# auto-detect NDVI column (override if needed)
+NDVI_COL <- NA_character_  # set e.g. "ndvi_mean" if you want
+if (is.na(NDVI_COL)) {
+  cand <- names(climate_full)[str_to_lower(names(climate_full)) %in%
+                                c("ndvi", "ndvi_mean", "mean_ndvi", "ndvi_avg", "avg_ndvi")]
+  if (length(cand) == 0) {
+    stop("Could not find an NDVI column in climate_full. Set NDVI_COL to the correct column name.")
+  }
+  NDVI_COL <- cand[1]
+}
+message("Using NDVI column: ", NDVI_COL)
+
+climate_ndvi_raw <- climate_full %>%
+  select(sample_id, ndvi = all_of(NDVI_COL)) %>%
+  group_by(sample_id) %>%
+  summarise(ndvi = mean(ndvi, na.rm = TRUE), .groups = "drop")
+
+get_ndvi_for_matrix <- function(pa_mat, merged_flag = FALSE, replicate_pairs = NULL, climate_ndvi_raw) {
+  nd <- climate_ndvi_raw
+
+  if (merged_flag) {
+    lookup <- make_replicate_lookup(replicate_pairs)
+    nd <- nd %>%
+      mutate(sample_id = if_else(sample_id %in% names(lookup), lookup[sample_id], sample_id)) %>%
+      group_by(sample_id) %>%
+      summarise(ndvi = mean(ndvi, na.rm = TRUE), .groups = "drop")
+  }
+
+  nd <- nd %>% filter(sample_id %in% rownames(pa_mat))
+  nd <- nd[match(rownames(pa_mat), nd$sample_id), ]
+  nd %>% rename(sample_name = sample_id)
+}
+
+###############################################################################
+# 03) CITIES + INFLUENCE FUNCTION
+###############################################################################
+
+cities_all <- data.frame(
+  name = c(
+    "Rundu", "Divundu", "Shakawe", "Sepopa", "Seronga", "Mukwe", "Andara",
+    "Bagani", "Gumare", "Beetsha", "Etsa", "Nokaneng", "Nkurenkuru",
+    "Katima_Mulilo"
+  ),
+  lon = c(
+    19.65, 21.45, 21.85, 22.70, 23.05, 21.38, 21.42,
+    21.61645, 22.16498, 22.31180, 22.42620, 22.18300, 18.00,
+    24.2833
+  ),
+  lat = c(
+    -17.91, -18.12, -18.37, -19.40, -18.82, -18.05, -18.08,
+    -18.11065, -19.37198, -18.87070, -18.70870, -19.66600, -17.65,
+    -17.5023
+  ),
+  pop_size = c(
+    119000, 5000, 12000, 3000, 2500, 1500, 1200,
+    2000, 9000, 2000, 1500, 2000, 15000,
+    35000
+  )
+)
+
+urban_influence_for_sample <- function(point_lon, point_lat, cities_df) {
+  d_m  <- geosphere::distHaversine(cbind(point_lon, point_lat),
+                                  cbind(cities_df$lon, cities_df$lat))
+  d_km <- d_m / 1000
+  influence <- cities_df$pop_size * exp(-d_km / 10)
+  idx <- which.max(influence)
+  list(
+    urban_max     = influence[idx],
+    urban_sum     = sum(influence),
+    dominant_city = cities_df$name[idx],
+    dominant_dist = d_km[idx],
+    dominant_pop  = cities_df$pop_size[idx]
+  )
+}
+
+###############################################################################
+# 04) PLOT HELPERS
+###############################################################################
+
+safe_cor <- function(a, b) {
+  ok <- is.finite(a) & is.finite(b)
+  a <- a[ok]; b <- b[ok]
+  if (length(a) < 3) return(0)
+  if (sd(a) == 0 || sd(b) == 0) return(0)
+  out <- suppressWarnings(cor(a, b))
+  ifelse(is.finite(out), out, 0)
+}
+
+arrow_from_variable <- function(df, varname) {
+  x <- df$PCoA1; y <- df$PCoA2; z <- df[[varname]]
+  ux <- safe_cor(x, z)
+  uy <- safe_cor(y, z)
+  scale_fac <- 0.4 * min(diff(range(x, na.rm = TRUE)), diff(range(y, na.rm = TRUE)))
+  tibble(xend = ux * scale_fac, yend = uy * scale_fac)
+}
+
+plot_pcoa_with_urban_three_arrows <- function(plot_df, var_exp, title) {
+  base <- ggplot(plot_df, aes(PCoA1, PCoA2)) +
+    geom_point(aes(color = urban_influence_max), size = 4) +
+    scale_color_viridis(option = "plasma") +
+    labs(
+      x = paste0("PCoA1 (", round(var_exp[1], 1), "%)"),
+      y = paste0("PCoA2 (", round(var_exp[2], 1), "%)"),
+      color = "Urban Influence (max)",
+      title = title
+    ) +
+    theme_minimal()
+
+  a_max  <- arrow_from_variable(plot_df, "urban_influence_max")
+  a_sum  <- arrow_from_variable(plot_df, "urban_influence_sum")
+  a_ndvi <- arrow_from_variable(plot_df, "ndvi")
+
+  base +
+    geom_segment(
+      data = a_max,
+      aes(x = 0, y = 0, xend = xend, yend = yend),
+      arrow = grid::arrow(length = grid::unit(0.3, "cm")),
+      linewidth = 1.1
+    ) +
+    geom_segment(
+      data = a_sum,
+      aes(x = 0, y = 0, xend = xend, yend = yend),
+      arrow = grid::arrow(length = grid::unit(0.3, "cm")),
+      linewidth = 1.1,
+      linetype = "dashed"
+    ) +
+    geom_segment(
+      data = a_ndvi,
+      aes(x = 0, y = 0, xend = xend, yend = yend),
+      arrow = grid::arrow(length = grid::unit(0.3, "cm")),
+      linewidth = 1.1,
+      linetype = "dotdash"
+    )
+}
+
+scatter_plot <- function(df, xvar, yvar, title, line_col = "steelblue") {
+  ggplot(df, aes(x = .data[[xvar]], y = .data[[yvar]])) +
+    geom_point(size = 3, color = "black") +
+    geom_smooth(method = "lm", se = TRUE, color = line_col) +
+    theme_minimal() +
+    labs(title = title, x = xvar, y = yvar)
+}
+
+###############################################################################
+# 05) ITERATE OVER ALL PA MATRICES
+###############################################################################
+
+pa_files <- list.files(PA_DIR, pattern = "\\.rds$", full.names = TRUE, recursive = TRUE)
+message("Found PA matrices: ", length(pa_files))
+stopifnot(length(pa_files) >= 1)
+
+summary_rows <- list()
+
+for (f in pa_files) {
+  base_name   <- tools::file_path_sans_ext(basename(f))
+  merged_flag <- stringr::str_detect(base_name, "__merged$")
+
+  message("\n--- Running: ", base_name, " ---")
+
+  tryCatch({
+
+    pa_matrix <- readRDS(f) %>% as.matrix()
+    stopifnot(nrow(pa_matrix) >= 3)
+
+    # Distances + PCoA (Jaccard total)
+    beta_indices <- betapart::beta.pair(pa_matrix, index.family = "jaccard")
+    pcoa <- ade4::dudi.pco(
+      d = ade4::quasieuclid(beta_indices$beta.jac),
+      scannf = FALSE,
+      nf = 3
+    )
+    var_exp <- 100 * pcoa$eig / sum(pcoa$eig)
+
+    # Coords + urban influence
+    coords <- get_coords_for_matrix(pa_matrix, sample_meta, merged_flag, replicate_pairs) %>%
+      rename(sample_name = sample_id)
+
+    coords_city <- coords %>%
+      rowwise() %>%
+      mutate(
+        inf = list(urban_influence_for_sample(decimalLongitude, decimalLatitude, cities_all)),
+        urban_influence_max = inf$urban_max,
+        urban_influence_sum = inf$urban_sum,
+        dominant_city       = inf$dominant_city,
+        dominant_distance   = inf$dominant_dist,
+        dominant_pop        = inf$dominant_pop
+      ) %>%
+      ungroup() %>%
+      select(-inf)
+
+    # NDVI aligned to matrix rownames
+    ndvi_df <- get_ndvi_for_matrix(pa_matrix, merged_flag, replicate_pairs, climate_ndvi_raw)
+
+    # Plot table
+    plot_df <- tibble(
+      sample_name = rownames(pcoa$li),
+      PCoA1 = pcoa$li$A1,
+      PCoA2 = pcoa$li$A2,
+      PCoA3 = pcoa$li$A3
+    ) %>%
+      left_join(coords_city %>% select(sample_name, urban_influence_max, urban_influence_sum),
+                by = "sample_name") %>%
+      left_join(ndvi_df %>% select(sample_name, ndvi),
+                by = "sample_name")
+
+    # PERMANOVA models (one predictor each)
+    perma_max  <- vegan::adonis2(beta_indices$beta.jac ~ urban_influence_max, data = plot_df, permutations = 999)
+    perma_sum  <- vegan::adonis2(beta_indices$beta.jac ~ urban_influence_sum, data = plot_df, permutations = 999)
+    perma_ndvi <- vegan::adonis2(beta_indices$beta.jac ~ ndvi,                data = plot_df, permutations = 999)
+
+    p_max  <- perma_max$`Pr(>F)`[1];  r2_max  <- perma_max$R2[1]
+    p_sum  <- perma_sum$`Pr(>F)`[1];  r2_sum  <- perma_sum$R2[1]
+    p_ndvi <- perma_ndvi$`Pr(>F)`[1]; r2_ndvi <- perma_ndvi$R2[1]
+
+    perma_out <- bind_rows(
+      tibble(model = "urban_influence_max", R2 = r2_max,  p = p_max),
+      tibble(model = "urban_influence_sum", R2 = r2_sum,  p = p_sum),
+      tibble(model = "ndvi",                R2 = r2_ndvi, p = p_ndvi)
+    )
+
+    # Always write tables
+    write.csv(perma_out,
+              file.path(RESULT_DIR, "PERMANOVA", paste0(base_name, "__PERMANOVA_max_sum_ndvi.csv")),
+              row.names = FALSE)
+    write.csv(plot_df,
+              file.path(RESULT_DIR, "TABLES", paste0(base_name, "__plot_data.csv")),
+              row.names = FALSE)
+    write.csv(coords_city,
+              file.path(RESULT_DIR, "TABLES", paste0(base_name, "__sample_coords_with_city.csv")),
+              row.names = FALSE)
+
+    summary_rows[[base_name]] <- tibble(
+      matrix  = base_name,
+      R2_max  = r2_max,  p_max  = p_max,
+      R2_sum  = r2_sum,  p_sum  = p_sum,
+      R2_ndvi = r2_ndvi, p_ndvi = p_ndvi
+    )
+
+    # Plots only if any raw p < alpha
+    sig_any <- any(c(p_max, p_sum, p_ndvi) < alpha, na.rm = TRUE)
+
+    if (sig_any) {
+      message("   📈 Significant -> saving plots (alpha=", alpha, ")")
+
+      p_pcoa <- plot_pcoa_with_urban_three_arrows(
+        plot_df, var_exp,
+        paste0("PCoA (Jaccard) — ", base_name)
+      )
+
+      ggsave(
+        filename = file.path(RESULT_DIR, "PLOTS_PCOA",
+                             paste0(base_name, "__PCoA_urbanMaxColor__arrows_max_sum_ndvi.png")),
+        plot = p_pcoa, width = 9, height = 6, dpi = 300, bg = "white"
+      )
+      ggsave(
+        filename = file.path(RESULT_DIR, "PLOTS_PCOA",
+                             paste0(base_name, "__PCoA_urbanMaxColor__arrows_max_sum_ndvi.pdf")),
+        plot = p_pcoa, width = 9, height = 6, device = PDF_DEVICE
+      )
+
+      # Scatter plots (6)
+      p1 <- scatter_plot(plot_df, "urban_influence_max", "PCoA1", paste0(base_name, " — max vs PCoA1"), "red3")
+      p2 <- scatter_plot(plot_df, "urban_influence_max", "PCoA2", paste0(base_name, " — max vs PCoA2"), "blue3")
+      p3 <- scatter_plot(plot_df, "urban_influence_sum", "PCoA1", paste0(base_name, " — sum vs PCoA1"), "red3")
+      p4 <- scatter_plot(plot_df, "urban_influence_sum", "PCoA2", paste0(base_name, " — sum vs PCoA2"), "blue3")
+      p5 <- scatter_plot(plot_df, "ndvi",                "PCoA1", paste0(base_name, " — ndvi vs PCoA1"), "red3")
+      p6 <- scatter_plot(plot_df, "ndvi",                "PCoA2", paste0(base_name, " — ndvi vs PCoA2"), "blue3")
+
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__max_vs_PCoA1.png")),
+             plot = p1, width = 7, height = 5, dpi = 300, bg = "white")
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__max_vs_PCoA2.png")),
+             plot = p2, width = 7, height = 5, dpi = 300, bg = "white")
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__sum_vs_PCoA1.png")),
+             plot = p3, width = 7, height = 5, dpi = 300, bg = "white")
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__sum_vs_PCoA2.png")),
+             plot = p4, width = 7, height = 5, dpi = 300, bg = "white")
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__ndvi_vs_PCoA1.png")),
+             plot = p5, width = 7, height = 5, dpi = 300, bg = "white")
+      ggsave(file.path(RESULT_DIR, "PLOTS_SCATTER", paste0(base_name, "__ndvi_vs_PCoA2.png")),
+             plot = p6, width = 7, height = 5, dpi = 300, bg = "white")
+
+    } else {
+      message("   💤 Not significant (alpha=", alpha, ") -> skipping plots")
+    }
+
+    message("✅ Done: ", base_name)
+
+  }, error = function(e) {
+    message("❌ FAILED: ", base_name)
+    message("   Reason: ", conditionMessage(e))
+    summary_rows[[base_name]] <- tibble(
+      matrix  = base_name,
+      R2_max  = NA, p_max  = NA,
+      R2_sum  = NA, p_sum  = NA,
+      R2_ndvi = NA, p_ndvi = NA
+    )
+  })
+}
+
+###############################################################################
+# 06) SUMMARY + BH-FDR (per variable across matrices)
+###############################################################################
+
+summary_df <- bind_rows(summary_rows)
+
+# BH-FDR: treat each predictor as its own hypothesis family
+summary_df <- summary_df %>%
+  mutate(
+    p_max_fdr  = p.adjust(p_max,  method = "BH"),
+    p_sum_fdr  = p.adjust(p_sum,  method = "BH"),
+    p_ndvi_fdr = p.adjust(p_ndvi, method = "BH")
+  ) %>%
+  arrange(matrix)
+
+write.csv(summary_df, file.path(RESULT_DIR, "SUMMARY_permanova.csv"), row.names = FALSE)
+
+message("\n🎉 Finished all. Output folder: ", RESULT_DIR)
+message("Log written to: ", log_file)
+
+# also print to console/log
+print(summary_df, n = Inf)
+
+sink()
+close(zz)
+
+
