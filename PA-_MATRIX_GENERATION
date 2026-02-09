@@ -1,5 +1,5 @@
 ###############################################################################
-# 02_make_matrices.R  —  build 24 PA matrices (SWARM + DADA2), merged & unmerged
+# 03_make_matrices.R  —  build 24 PA matrices (SWARM + DADA2), merged & unmerged
 #
 # Output:
 #   - results/PA_matrices/*.rds   (24 matrices)
