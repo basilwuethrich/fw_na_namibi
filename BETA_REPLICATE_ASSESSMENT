@@ -1,0 +1,428 @@
+###############################################################################
+# 02_beta_replicate_assessment.R  —  REPLICATE MERGE CHECK (SWARM + DADA2)
+#
+# Ziel:
+#  - Beta-Diversität (Jaccard/Sørensen) je Pipeline berechnen
+#  - Within-site (Replicate) Distanzen vs Between-site Distanzen vergleichen
+#  - Turnover & Nestedness (betapart) extrahieren
+#  - Stacked Barplot für Replicate-Paare (Turnover + Nestedness)
+#
+# Inputs (aus config.yml):
+#  - data/processed/sample_meta.rds
+#  - data/processed/swarm_clean_long.rds
+#  - data/processed/dada2_clean_long.rds
+#
+# Outputs:
+#  - results/beta_replicates/*.png, *.rds, *.csv, *.tex
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(betapart)
+  library(vegan)
+  library(here)
+  library(yaml)
+})
+
+# Optional (bessere PNGs). Kein install im Skript.
+HAS_RAGG <- requireNamespace("ragg", quietly = TRUE)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+assert_file_exists <- function(path) {
+  if (!file.exists(path)) stop("Missing file: ", path, call. = FALSE)
+}
+
+assert_has_cols <- function(df, cols, df_name = "data") {
+  miss <- setdiff(cols, names(df))
+  if (length(miss) > 0) {
+    stop(df_name, " is missing column(s): ", paste(miss, collapse = ", "), call. = FALSE)
+  }
+}
+
+safe_first <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) NA_character_ else x[[1]]
+}
+
+# ----------------------------
+# 00) Load config
+# ----------------------------
+cfg <- yaml::read_yaml(here::here("config", "config.yml"))
+
+in_sample_meta <- here::here(cfg$beta_replicates$inputs$sample_meta_rds)
+in_swarm_long  <- here::here(cfg$beta_replicates$inputs$swarm_long_rds)
+in_dada2_long  <- here::here(cfg$beta_replicates$inputs$dada2_long_rds)
+
+out_dir <- here::here(cfg$beta_replicates$outputs$out_dir)
+tables_dir <- file.path(out_dir, cfg$beta_replicates$outputs$tables_subdir)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+
+index_family <- cfg$beta_replicates$params$index_family %||% "jaccard"
+coord_round_digits <- cfg$beta_replicates$params$coord_round_digits %||% 5
+within_test_alt <- cfg$beta_replicates$params$within_test_alt %||% "less"
+
+assert_file_exists(in_sample_meta)
+assert_file_exists(in_swarm_long)
+assert_file_exists(in_dada2_long)
+
+# ----------------------------
+# 01) Load
+# ----------------------------
+sample_meta <- readRDS(in_sample_meta)
+swarm_long  <- readRDS(in_swarm_long)
+dada2_long  <- readRDS(in_dada2_long)
+
+stopifnot(nrow(sample_meta) > 0, nrow(swarm_long) > 0, nrow(dada2_long) > 0)
+assert_has_cols(sample_meta, c("sample_id"), "sample_meta")
+assert_has_cols(swarm_long,  c("sample_id","feature_id","count"), "swarm_clean_long")
+assert_has_cols(dada2_long,  c("sample_id","feature_id","count"), "dada2_clean_long")
+
+# ----------------------------
+# 02) Ensure site_id
+# ----------------------------
+if (!"site_id" %in% names(sample_meta)) {
+  message("INFO: sample_meta has no site_id -> building from rounded coords.")
+  assert_has_cols(sample_meta, c("decimalLatitude","decimalLongitude"), "sample_meta")
+
+  sample_meta <- sample_meta %>%
+    mutate(
+      lat_r  = round(decimalLatitude, coord_round_digits),
+      lon_r  = round(decimalLongitude, coord_round_digits),
+      site_id = paste0("site_", dense_rank(paste(lat_r, lon_r)))
+    ) %>%
+    select(-lat_r, -lon_r)
+}
+
+# ----------------------------
+# 03) Core functions
+# ----------------------------
+make_pa_matrix <- function(clean_long, sample_meta, feature_col = "feature_id") {
+
+  df <- clean_long %>%
+    group_by(sample_id, .data[[feature_col]]) %>%
+    summarise(count = sum(count, na.rm = TRUE), .groups = "drop") %>%
+    filter(count > 0) %>%
+    mutate(pa = 1L)
+
+  pa_wide <- df %>%
+    select(sample_id, feature = .data[[feature_col]], pa) %>%
+    distinct() %>%
+    tidyr::pivot_wider(names_from = feature, values_from = pa, values_fill = 0)
+
+  mat <- pa_wide %>%
+    tibble::column_to_rownames("sample_id") %>%
+    as.matrix()
+
+  # betapart erwartet binär (0/1)
+  mat[mat > 0] <- 1L
+
+  # site_id in gleicher Reihenfolge wie rownames(mat)
+  site_id <- sample_meta %>%
+    filter(sample_id %in% rownames(mat)) %>%
+    arrange(match(sample_id, rownames(mat))) %>%
+    pull(site_id)
+
+  stopifnot(length(site_id) == nrow(mat))
+
+  list(pa_matrix = mat, site_id = site_id)
+}
+
+beta_pair_tables <- function(pa_matrix, site_id, index_family = "jaccard") {
+
+  beta_res <- betapart::beta.pair(pa_matrix, index.family = index_family)
+
+  # jaccard => beta.jtu (turnover), beta.jne (nestedness), beta.jac (total)
+  # sorensen => beta.stu, beta.sne, beta.sor
+  prefix <- substr(index_family, 1, 1)  # "j" or "s"
+  turnover   <- as.matrix(beta_res[[paste0("beta.", prefix, "tu")]])
+  nestedness <- as.matrix(beta_res[[paste0("beta.", prefix, "ne")]])
+
+  total_name <- if (index_family == "jaccard") paste0("beta.", prefix, "ac") else "beta.sor"
+  total <- as.matrix(beta_res[[total_name]])
+
+  samp <- rownames(pa_matrix)
+
+  pair_df <- expand.grid(i = seq_along(samp), j = seq_along(samp)) %>%
+    filter(i < j) %>%
+    mutate(
+      sample_i = samp[i],
+      sample_j = samp[j],
+      site_i = site_id[i],
+      site_j = site_id[j],
+      within_site = (site_i == site_j),
+      turnover   = purrr::map2_dbl(i, j, ~ turnover[.x, .y]),
+      nestedness = purrr::map2_dbl(i, j, ~ nestedness[.x, .y]),
+      total_beta = purrr::map2_dbl(i, j, ~ total[.x, .y])
+    )
+
+  list(
+    beta_res = beta_res,
+    turnover = turnover,
+    nestedness = nestedness,
+    total = total,
+    pairwise = pair_df
+  )
+}
+
+make_rep_bar_data <- function(pairwise_df) {
+
+  rep_pairs <- pairwise_df %>%
+    filter(within_site) %>%
+    mutate(
+      Site = site_i,
+      PairLabel = paste0(sample_i, " vs ", sample_j)
+    ) %>%
+    select(Site, PairLabel, turnover, nestedness, total_beta)
+
+  if (nrow(rep_pairs) == 0) return(tibble())
+
+  rep_long <- rep_pairs %>%
+    pivot_longer(cols = c(turnover, nestedness),
+                 names_to = "Component",
+                 values_to = "Distance") %>%
+    mutate(
+      Component = recode(Component,
+                         turnover = "Turnover",
+                         nestedness = "Nestedness")
+    )
+
+  # stabile Reihenfolge nach Site (alphabetisch) -> Pair_1..n
+  site_labels <- sort(unique(rep_long$Site))
+  rep_long <- rep_long %>%
+    mutate(Pair = factor(Site, levels = site_labels,
+                         labels = paste0("Pair_", seq_along(site_labels))))
+
+  rep_long
+}
+
+save_plot <- function(p, filename, width, height, dpi = 300) {
+  if (HAS_RAGG) {
+    ggplot2::ggsave(filename, p, width = width, height = height, dpi = dpi,
+                    bg = "white", device = ragg::agg_png)
+  } else {
+    ggplot2::ggsave(filename, p, width = width, height = height, dpi = dpi,
+                    bg = "white")
+  }
+}
+
+plot_rep_stacked <- function(rep_data, title, out_file = NULL) {
+
+  if (nrow(rep_data) == 0) {
+    message("WARN: No within-site replicate pairs found -> no stacked barplot.")
+    return(NULL)
+  }
+
+  p <- ggplot(rep_data, aes(x = Pair, y = Distance, fill = Component)) +
+    geom_bar(stat = "identity", position = "stack") +
+    labs(
+      title = title,
+      x = "Replicate pair (grouped by site_id)",
+      y = paste0(index_family, " distance components"),
+      fill = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      plot.title = element_text(color = "black", face = "bold"),
+      legend.text = element_text(color = "black"),
+      panel.grid.major = element_line(color = "grey80"),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "top"
+    )
+
+  if (!is.null(out_file)) save_plot(p, out_file, width = 10, height = 5)
+  p
+}
+
+plot_within_between <- function(pairwise_df, metric, title, out_file = NULL) {
+
+  df <- pairwise_df %>%
+    select(within_site, value = all_of(metric)) %>%
+    mutate(group = if_else(within_site, "Within site (Replicates)", "Between sites"))
+
+  p <- ggplot(df, aes(x = group, y = value)) +
+    geom_violin(trim = TRUE, fill = "grey80") +
+    geom_boxplot(width = 0.2, outlier.alpha = 0.3) +
+    labs(title = title, x = NULL, y = metric) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      plot.title = element_text(color = "black", face = "bold"),
+      panel.grid.major = element_line(color = "grey80"),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(angle = 15, hjust = 1)
+    )
+
+  if (!is.null(out_file)) save_plot(p, out_file, width = 8, height = 5)
+  p
+}
+
+within_between_test <- function(pairwise_df, metric, alternative = "less") {
+
+  w <- pairwise_df %>% filter(within_site) %>% pull(all_of(metric))
+  b <- pairwise_df %>% filter(!within_site) %>% pull(all_of(metric))
+
+  if (length(w) < 2 || length(b) < 2) {
+    return(tibble(
+      metric = metric,
+      ok = FALSE,
+      note = "Too few pairs for test (need >=2 within and >=2 between)."
+    ))
+  }
+
+  tst <- suppressWarnings(stats::wilcox.test(w, b, alternative = alternative))
+
+  tibble(
+    metric = metric,
+    ok = TRUE,
+    n_within = length(w),
+    n_between = length(b),
+    mean_within = mean(w),
+    mean_between = mean(b),
+    ratio_within_between = mean(w) / mean(b),
+    p_value = unname(tst$p.value)
+  )
+}
+
+decide_merge <- function(test_tbl, pipeline) {
+  test_tbl %>%
+    mutate(
+      pipeline = pipeline,
+      suggestion = case_when(
+        ok & ratio_within_between < 0.5 & p_value < 0.05 ~ "Merging well supported (within << between).",
+        ok & ratio_within_between < 0.8 & p_value < 0.05 ~ "Merging often ok, but moderate within-differences.",
+        ok ~ "Caution: within not clearly smaller than between.",
+        TRUE ~ "Not assessable (too few pairs)."
+      )
+    ) %>%
+    select(pipeline, metric, n_within, n_between, mean_within, mean_between,
+           ratio_within_between, p_value, suggestion, everything())
+}
+
+summarise_within_between <- function(pairwise_df, pipeline_label) {
+  pairwise_df %>%
+    mutate(group = if_else(within_site, "within", "between")) %>%
+    pivot_longer(cols = c(total_beta, turnover, nestedness),
+                 names_to = "metric",
+                 values_to = "value") %>%
+    group_by(group, metric) %>%
+    summarise(
+      n = sum(!is.na(value)),
+      mean = mean(value, na.rm = TRUE),
+      sd = sd(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(pipeline = pipeline_label) %>%
+    select(pipeline, metric, group, n, mean, sd)
+}
+
+# ----------------------------
+# 04) Run helper wrapper (pipeline)
+# ----------------------------
+run_pipeline <- function(clean_long, sample_meta, pipeline_label) {
+
+  pa <- make_pa_matrix(clean_long, sample_meta, feature_col = "feature_id")
+  beta <- beta_pair_tables(pa$pa_matrix, pa$site_id, index_family = index_family)
+  rep_data <- make_rep_bar_data(beta$pairwise)
+
+  # plots
+  p_bar <- plot_rep_stacked(
+    rep_data,
+    title = paste0(pipeline_label, " — Turnover & Nestedness per site_id (within-site replicates)"),
+    out_file = file.path(out_dir, paste0(pipeline_label, "_stacked_turnover_nestedness.png"))
+  )
+
+  p_total <- plot_within_between(
+    beta$pairwise, "total_beta",
+    title = paste0(pipeline_label, " — Total beta (", index_family, "): Within-site vs Between-site"),
+    out_file = file.path(out_dir, paste0(pipeline_label, "_within_between_total.png"))
+  )
+
+  p_turn <- plot_within_between(
+    beta$pairwise, "turnover",
+    title = paste0(pipeline_label, " — Turnover: Within-site vs Between-site"),
+    out_file = file.path(out_dir, paste0(pipeline_label, "_within_between_turnover.png"))
+  )
+
+  p_nest <- plot_within_between(
+    beta$pairwise, "nestedness",
+    title = paste0(pipeline_label, " — Nestedness: Within-site vs Between-site"),
+    out_file = file.path(out_dir, paste0(pipeline_label, "_within_between_nestedness.png"))
+  )
+
+  # tests + decision
+  tests <- bind_rows(
+    within_between_test(beta$pairwise, "total_beta", alternative = within_test_alt),
+    within_between_test(beta$pairwise, "turnover",   alternative = within_test_alt),
+    within_between_test(beta$pairwise, "nestedness", alternative = within_test_alt)
+  )
+
+  decision <- decide_merge(tests, pipeline_label)
+
+  list(
+    pa_matrix = pa$pa_matrix,
+    site_id = pa$site_id,
+    pairwise = beta$pairwise,
+    rep_bar_data = rep_data,
+    tests = tests,
+    decision = decision,
+    plots = list(bar = p_bar, total = p_total, turnover = p_turn, nestedness = p_nest)
+  )
+}
+
+# ----------------------------
+# 05) RUN: SWARM + DADA2
+# ----------------------------
+res_swarm <- run_pipeline(swarm_long, sample_meta, "SWARM")
+res_dada2 <- run_pipeline(dada2_long, sample_meta, "DADA2")
+
+# ----------------------------
+# 06) Console summary
+# ----------------------------
+message("\n==================== MERGE CHECK SUMMARY ====================")
+print(res_swarm$decision)
+print(res_dada2$decision)
+message("\nPlots saved to: ", out_dir)
+
+# ----------------------------
+# 07) Mean ± SD tables + exports
+# ----------------------------
+wb_swarm <- summarise_within_between(res_swarm$pairwise, "SWARM")
+wb_dada2 <- summarise_within_between(res_dada2$pairwise, "DADA2")
+wb_summary <- bind_rows(wb_swarm, wb_dada2)
+
+wb_summary_wide <- wb_summary %>%
+  pivot_wider(
+    id_cols = c(pipeline, metric),
+    names_from = group,
+    values_from = c(n, mean, sd)
+  ) %>%
+  arrange(pipeline, metric)
+
+write.csv(wb_summary_wide, file.path(out_dir, "within_between_mean_sd.csv"), row.names = FALSE)
+
+# Optional LaTeX exports (only if knitr installed)
+if (requireNamespace("knitr", quietly = TRUE)) {
+  dec_swarm_tex <- knitr::kable(res_swarm$decision, format = "latex", booktabs = TRUE, digits = 3,
+                               caption = "Merge check summary (SWARM): within-site vs between-site dissimilarities.")
+  dec_dada2_tex <- knitr::kable(res_dada2$decision, format = "latex", booktabs = TRUE, digits = 3,
+                               caption = "Merge check summary (DADA2): within-site vs between-site dissimilarities.")
+  writeLines(dec_swarm_tex, file.path(tables_dir, "SWARM_merge_check_decision.tex"))
+  writeLines(dec_dada2_tex, file.path(tables_dir, "DADA2_merge_check_decision.tex"))
+
+  wb_tex <- knitr::kable(wb_summary_wide, format = "latex", booktabs = TRUE, digits = 3,
+                        caption = "Within-site vs between-site dissimilarity (mean $\\pm$ SD) for total beta, turnover and nestedness.")
+  writeLines(wb_tex, file.path(tables_dir, "within_between_mean_sd.tex"))
+}
+
+# ----------------------------
+# 08) Save results objects
+# ----------------------------
+saveRDS(res_swarm, file.path(out_dir, "SWARM_beta_replicate_results.rds"))
+saveRDS(res_dada2, file.path(out_dir, "DADA2_beta_replicate_results.rds"))
