@@ -1,0 +1,290 @@
+###############################################################################
+# 04_richness_climate_models.R — Richness ~ Climate (+ Marker) per pipeline
+#
+# Inputs:
+#   data/processed/sample_meta.rds
+#   data/processed/swarm_clean_long.rds
+#   data/processed/dada2_clean_long.rds
+#   data/processed/okavango_climate_points_daily_chirps_temp14.csv
+#   data/processed/okavango_climate_points_modis_s2_ndvi.csv
+#
+# Outputs:
+#   results/richness_models/
+#     pipeline_output.txt
+#     env_sample.csv
+#     richness_swarm.csv
+#     richness_dada2.csv
+#
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(here)
+  library(MASS)
+  library(mgcv)
+})
+
+###############################################################################
+# 00) CONFIG
+###############################################################################
+
+DATA_DIR <- here::here("data", "processed")
+OUT_DIR  <- here::here("results", "richness_models")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+path_sample_meta  <- file.path(DATA_DIR, "sample_meta.rds")
+path_swarm_long   <- file.path(DATA_DIR, "swarm_clean_long.rds")
+path_dada2_long   <- file.path(DATA_DIR, "dada2_clean_long.rds")
+
+path_climate_chirps <- file.path(DATA_DIR, "okavango_climate_points_daily_chirps_temp14.csv")
+path_climate_ndvi   <- file.path(DATA_DIR, "okavango_climate_points_modis_s2_ndvi.csv")
+
+stopifnot(file.exists(path_sample_meta),
+          file.exists(path_swarm_long),
+          file.exists(path_dada2_long),
+          file.exists(path_climate_chirps),
+          file.exists(path_climate_ndvi))
+
+# Optional: replicate merge
+MERGE_REPS <- FALSE
+
+replicate_pairs <- list(
+  c("SPY221856", "SPY221857"),
+  c("SPY221858", "SPY221859"),
+  c("SPY221860", "SPY221861"),
+  c("SPY221862", "SPY221863"),
+  c("SPY221864", "SPY221865"),
+  c("SPY221866", "SPY221867"),
+  c("SPY221868", "SPY221869"),
+  c("SPY221872", "SPY221873"),
+  c("SPY221870", "SPY221871"),
+  c("SPY221653", "SPY221654")
+)
+
+# Overdispersion rule of thumb: > 1.3 => NB recommended
+alpha_overdisp <- 1.3
+
+# Model predictors to test
+preds_num <- c("ndvi_mean", "ndvi_modis_mean", "temp_mean", "temp14_mean")
+preds_fac <- c("marker")
+
+###############################################################################
+# 01) LOAD
+###############################################################################
+
+sample_meta      <- readRDS(path_sample_meta)
+swarm_clean_long <- readRDS(path_swarm_long)
+dada2_clean_long <- readRDS(path_dada2_long)
+
+clim_chirps <- readr::read_csv(path_climate_chirps, show_col_types = FALSE)
+clim_ndvi   <- readr::read_csv(path_climate_ndvi,   show_col_types = FALSE)
+
+# If sample_meta uses sample_name instead of sample_id
+if (!"sample_id" %in% names(sample_meta) && "sample_name" %in% names(sample_meta)) {
+  sample_meta <- sample_meta %>% rename(sample_id = sample_name)
+}
+
+###############################################################################
+# 02) CLIMATE JOIN (id as character)
+###############################################################################
+
+clim_chirps <- clim_chirps %>% mutate(id = as.character(id))
+clim_ndvi   <- clim_ndvi   %>% mutate(id = as.character(id))
+
+# Join NDVI modis column onto chirps table
+climate_full <- clim_chirps %>%
+  left_join(clim_ndvi %>% select(id, ndvi_modis_may), by = "id")
+
+###############################################################################
+# 03) OPTIONAL: replicate merge mapping
+###############################################################################
+
+make_replicate_lookup <- function(replicate_pairs) {
+  lookup <- character()
+  for (pair in replicate_pairs) {
+    lookup[pair[1]] <- pair[1]
+    lookup[pair[2]] <- pair[1]
+  }
+  lookup
+}
+rep_lookup <- make_replicate_lookup(replicate_pairs)
+
+map_to_merged_id <- function(x) ifelse(x %in% names(rep_lookup), rep_lookup[x], x)
+
+###############################################################################
+# 04) RICHNESS per sample_id x marker
+###############################################################################
+
+make_richness_table <- function(long_df, pipeline_name) {
+  out <- long_df %>%
+    mutate(
+      pipeline  = pipeline_name,
+      sample_id = as.character(sample_id),
+      marker    = as.character(marker)
+    ) %>%
+    group_by(sample_id, marker) %>%
+    summarise(richness = n_distinct(feature_id), .groups = "drop")
+
+  if (MERGE_REPS) {
+    out <- out %>%
+      mutate(sample_id = map_to_merged_id(sample_id)) %>%
+      group_by(sample_id, marker) %>%
+      summarise(richness = max(richness), .groups = "drop")
+  }
+  out
+}
+
+rich_swarm <- make_richness_table(swarm_clean_long, "SWARM")
+rich_dada2 <- make_richness_table(dada2_clean_long, "DADA2")
+
+readr::write_csv(rich_swarm, file.path(OUT_DIR, "richness_swarm.csv"))
+readr::write_csv(rich_dada2, file.path(OUT_DIR, "richness_dada2.csv"))
+
+###############################################################################
+# 05) CLIMATE aggregated to sample-level (1 row per id)
+###############################################################################
+
+# NOTE: adjust column names here if your CSV differs
+env_sample <- climate_full %>%
+  mutate(
+    id   = as.character(id),
+    date = as.factor(date)
+  ) %>%
+  group_by(id) %>%
+  summarise(
+    ndvi_mean       = mean(ndvi, na.rm = TRUE),
+    ndvi_modis_mean = mean(ndvi_modis_may, na.rm = TRUE),
+    temp14_mean     = mean(temp14_C, na.rm = TRUE),
+    temp_mean       = mean(temp_mean_C, na.rm = TRUE),
+    precip_sum      = sum(precip_day_mm, na.rm = TRUE),
+    precip_sd       = sd(precip_day_mm, na.rm = TRUE),
+    n_days          = n(),
+    date_levels     = n_distinct(date),
+    .groups = "drop"
+  )
+
+if (MERGE_REPS) {
+  env_sample <- env_sample %>%
+    mutate(id = map_to_merged_id(id)) %>%
+    group_by(id) %>%
+    summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
+              .groups = "drop")
+}
+
+readr::write_csv(env_sample, file.path(OUT_DIR, "env_sample.csv"))
+
+###############################################################################
+# 06) JOIN richness + env
+###############################################################################
+
+dat_swarm <- rich_swarm %>%
+  rename(id = sample_id) %>%
+  left_join(env_sample, by = "id") %>%
+  mutate(pipeline = "SWARM")
+
+dat_dada2 <- rich_dada2 %>%
+  rename(id = sample_id) %>%
+  left_join(env_sample, by = "id") %>%
+  mutate(pipeline = "DADA2")
+
+###############################################################################
+# 07) MODEL WORKFLOW functions
+###############################################################################
+
+calc_overdisp <- function(glm_fit) {
+  sum(residuals(glm_fit, type = "pearson")^2) / glm_fit$df.residual
+}
+
+drop_constant_predictors <- function(df, vars) {
+  keep <- vars[sapply(vars, function(v) length(unique(df[[v]][!is.na(df[[v]])])) > 1)]
+  dropped <- setdiff(vars, keep)
+  list(keep = keep, dropped = dropped)
+}
+
+fit_pipeline_models <- function(dat_one, pipeline_label,
+                                preds_num, preds_fac,
+                                alpha_overdisp = 1.3) {
+
+  message("\n==============================")
+  message("PIPELINE: ", pipeline_label)
+  message("==============================")
+
+  # Basic clean: drop rows with missing response
+  dat_one <- dat_one %>% filter(!is.na(richness))
+
+  chk_num <- drop_constant_predictors(dat_one, preds_num)
+  chk_fac <- drop_constant_predictors(dat_one, preds_fac)
+
+  if (length(chk_num$dropped) > 0) message("Dropped constant numeric predictors: ", paste(chk_num$dropped, collapse = ", "))
+  if (length(chk_fac$dropped) > 0) message("Dropped constant factor predictors: ", paste(chk_fac$dropped, collapse = ", "))
+
+  rhs_terms <- c(chk_num$keep, chk_fac$keep)
+  if (length(rhs_terms) == 0) stop("No predictors left after removing constants.")
+
+  f_glm <- as.formula(paste("richness ~", paste(rhs_terms, collapse = " + ")))
+
+  # (1) Poisson
+  m_glm <- glm(f_glm, data = dat_one, family = poisson)
+  message("\n--- (1) GLM Poisson ---")
+  print(summary(m_glm))
+
+  overdisp <- calc_overdisp(m_glm)
+  message("Overdispersion (Poisson): ", round(overdisp, 3),
+          ifelse(overdisp > alpha_overdisp, "  -> overdispersed (NB recommended)", "  -> ok-ish"))
+
+  # (2) NB
+  m_nb <- MASS::glm.nb(f_glm, data = dat_one)
+  message("\n--- (2) MASS::glm.nb (Negative Binomial) ---")
+  print(summary(m_nb))
+
+  # (3) GAM NB
+  gam_terms_num <- if (length(chk_num$keep) > 0) paste0("s(", chk_num$keep, ")", collapse = " + ") else ""
+  gam_terms_fac <- if (length(chk_fac$keep) > 0) paste(chk_fac$keep, collapse = " + ") else ""
+  rhs_gam <- c(gam_terms_num, gam_terms_fac)
+  rhs_gam <- rhs_gam[rhs_gam != ""]
+  f_gam <- as.formula(paste("richness ~", paste(rhs_gam, collapse = " + ")))
+
+  m_gam <- mgcv::gam(f_gam, family = mgcv::nb(), data = dat_one, method = "REML")
+  message("\n--- (3) mgcv::gam (NB) ---")
+  print(summary(m_gam))
+
+  invisible(list(
+    data = dat_one,
+    glm_poisson = m_glm,
+    overdispersion = overdisp,
+    nb = m_nb,
+    gam_nb = m_gam,
+    dropped_numeric = chk_num$dropped,
+    dropped_factor = chk_fac$dropped
+  ))
+}
+
+###############################################################################
+# 08) RUN + LOG TO FILE
+###############################################################################
+
+log_file <- file.path(OUT_DIR, "pipeline_output.txt")
+zz <- file(log_file, open = "wt")
+sink(zz, split = TRUE)
+on.exit({ sink(); close(zz) }, add = TRUE)
+
+mods_swarm <- fit_pipeline_models(dat_swarm, "SWARM",
+                                 preds_num = preds_num,
+                                 preds_fac = preds_fac,
+                                 alpha_overdisp = alpha_overdisp)
+
+mods_dada2 <- fit_pipeline_models(dat_dada2, "DADA2",
+                                 preds_num = preds_num,
+                                 preds_fac = preds_fac,
+                                 alpha_overdisp = alpha_overdisp)
+
+sink()  # stop logging to file
+close(zz)
+
+message("✅ Finished. Outputs under: ", OUT_DIR)
+
+###############################################################################
+# 09) OPTIONAL: GAM plots (interactive)
+###############################################################################
+# plot(mods_swarm$gam_nb, pages = 1)
+# plot(mods_dada2$gam_nb, pages = 1)
